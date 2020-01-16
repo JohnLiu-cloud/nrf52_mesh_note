@@ -34,7 +34,6 @@
  * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
 #include <stdint.h>
 #include <string.h>
 
@@ -69,6 +68,10 @@
 #include "light_switch_example_common.h"
 #include "example_common.h"
 #include "ble_softdevice_support.h"
+
+#include "nrf_mesh_events.h"
+#include "nrf_mesh_serial.h"
+#include "nrf_mesh_dfu.h"
 
 #define APP_STATE_OFF                (0)
 #define APP_STATE_ON                 (1)
@@ -298,6 +301,91 @@ static void models_init_cb(void)
         ERROR_CHECK(generic_onoff_client_init(&m_clients[i], i + 1));
     }
 }
+#if NRF_MESH_SERIAL_ENABLE
+#define LEDS_MASK_DFU_RUNNING   (BSP_LED_0_MASK | BSP_LED_2_MASK)
+#define LEDS_MASK_DFU_ENDED     (BSP_LED_0_MASK | BSP_LED_1_MASK)
+static nrf_mesh_evt_handler_t m_evt_handler;
+
+static const uint32_t * optimal_bank_address(void)
+{
+    /* The incoming transfer has to fit on both sides of the bank address: First it needs to fit
+     * above the bank address when we receive it, then it needs to fit below the bank address when
+     * we install it. We want to put the bank address in the middle of the available application
+     * code area, to maximize the potential transfer size we can accept. */
+    const uint32_t * p_start;
+    uint32_t dummy;
+    ERROR_CHECK(mesh_stack_persistence_flash_usage(&p_start, &dummy));
+
+    uint32_t middle_of_app_area = (CODE_START + (intptr_t) p_start) / 2;
+
+    /* The bank can't start in the middle of the application code, and should be page aligned: */
+    return (const uint32_t *) ALIGN_VAL(MAX(middle_of_app_area, CODE_END), PAGE_SIZE);
+}
+
+static bool fw_updated_event_is_for_me(const nrf_mesh_evt_dfu_t * p_evt)
+{
+    switch (p_evt->fw_outdated.transfer.dfu_type)
+    {
+        case NRF_MESH_DFU_TYPE_APPLICATION:
+            return (p_evt->fw_outdated.current.application.app_id == p_evt->fw_outdated.transfer.id.application.app_id &&
+                    p_evt->fw_outdated.current.application.company_id == p_evt->fw_outdated.transfer.id.application.company_id &&
+                    p_evt->fw_outdated.current.application.app_version < p_evt->fw_outdated.transfer.id.application.app_version);
+
+        case NRF_MESH_DFU_TYPE_BOOTLOADER:
+            return (p_evt->fw_outdated.current.bootloader.bl_id == p_evt->fw_outdated.transfer.id.bootloader.bl_id &&
+                    p_evt->fw_outdated.current.bootloader.bl_version < p_evt->fw_outdated.transfer.id.bootloader.bl_version);
+
+        case NRF_MESH_DFU_TYPE_SOFTDEVICE:
+            return false;
+
+        default:
+            return false;
+    }
+}
+
+static void mesh_evt_handler(const nrf_mesh_evt_t* p_evt)
+{
+    switch (p_evt->type)
+    {
+        case NRF_MESH_EVT_DFU_FIRMWARE_OUTDATED:
+        case NRF_MESH_EVT_DFU_FIRMWARE_OUTDATED_NO_AUTH:
+            if (fw_updated_event_is_for_me(&p_evt->params.dfu))
+            {
+                const uint32_t * p_bank = optimal_bank_address();
+                __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Requesting DFU transfer with bank at 0x%p\n", p_bank);
+
+                ERROR_CHECK(nrf_mesh_dfu_request(p_evt->params.dfu.fw_outdated.transfer.dfu_type,
+                                                 &p_evt->params.dfu.fw_outdated.transfer.id,
+                                                 p_bank));
+                hal_led_mask_set(LEDS_MASK, false); /* Turn off all LEDs */
+            }
+            else
+            {
+                ERROR_CHECK(nrf_mesh_dfu_relay(p_evt->params.dfu.fw_outdated.transfer.dfu_type,
+                                               &p_evt->params.dfu.fw_outdated.transfer.id));
+            }
+            break;
+
+        case NRF_MESH_EVT_DFU_START:
+            hal_led_mask_set(LEDS_MASK_DFU_RUNNING, true);
+            break;
+
+        case NRF_MESH_EVT_DFU_END:
+            hal_led_mask_set(LEDS_MASK, false); /* Turn off all LEDs */
+            hal_led_mask_set(LEDS_MASK_DFU_ENDED, true);
+            break;
+
+        case NRF_MESH_EVT_DFU_BANK_AVAILABLE:
+            hal_led_mask_set(LEDS_MASK, false); /* Turn off all LEDs */
+            ERROR_CHECK(nrf_mesh_dfu_bank_flash(p_evt->params.dfu.bank.transfer.dfu_type));
+            break;
+
+        default:
+            break;
+
+    }
+}
+#endif
 
 static void mesh_init(void)
 {
@@ -321,6 +409,11 @@ static void mesh_init(void)
         default:
             ERROR_CHECK(status);
     }
+#if NRF_MESH_SERIAL_ENABLE
+    ERROR_CHECK(nrf_mesh_serial_init(NULL));
+    m_evt_handler.evt_cb = mesh_evt_handler;
+    nrf_mesh_evt_handler_add(&m_evt_handler);
+#endif
 }
 
 static void initialize(void)
@@ -363,7 +456,10 @@ static void start(void)
         };
         ERROR_CHECK(mesh_provisionee_prov_start(&prov_start_params));
     }
-
+#if NRF_MESH_SERIAL_ENABLE
+    __LOG(LOG_SRC_APP, LOG_LEVEL_INFO, "Enabling serial interface...\n");
+    ERROR_CHECK(nrf_mesh_serial_enable());
+#endif
     mesh_app_uuid_print(nrf_mesh_configure_device_uuid_get());
 
     ERROR_CHECK(mesh_stack_start());
@@ -382,3 +478,5 @@ int main(void)
         (void)sd_app_evt_wait();
     }
 }
+
+
